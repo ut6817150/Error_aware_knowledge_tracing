@@ -26,7 +26,7 @@ _CODE = {"N": 0, "A": 1, "P": 2}
 _BACK = {0: "N", 1: "A", 2: "P"}
 
 
-class PooledChains(MisconceptionChains):
+class GroupedChains(MisconceptionChains):
     """One chain per group, columns built by the P over A over N merge."""
 
     GROUPS = GROUPS
