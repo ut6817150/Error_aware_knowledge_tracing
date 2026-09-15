@@ -7,9 +7,11 @@ frozen. At every real turn the five filtered states, conditioned on
 strictly earlier units only, are pooled to one scalar m, so the m
 entering turn 1 is the chains' post-solution state. BKT itself trains
 from turn 1, the paper's population, the solution row is never a BKT
-observation. The channel is additive, competing risks with disjoint causes, every
-error has one cause, ordinary slip or belief capture, so the error
-probabilities add and beta reads as the belief-caused share of error.
+observation. The channel is additive, each wired branch's correct-probability loses
+beta * m, so beta is an absolute probability decrement per unit of chain
+state, at m near 1 a beta of 0.18 lowers the branch by up to 18 points.
+Clipping and competition with slip, guess, and latent mastery make any
+causal capture-rate reading unsafe, fitted betas are descriptive.
 
 The branch wiring is a class attribute set by the three subclasses,
 EmissionIntegrationPooledMastered places the channel beside slip only,
@@ -50,6 +52,7 @@ class EmissionIntegrationPooled:
     """F1 parent. Subclasses set CONNECTION to wire the channel's branch."""
 
     CONNECTION = None
+    CHANNELS = 1
 
     def __init__(self, train_data, test_data, chains=None, pooling="max",
                  seed=221, max_iterations=100, tolerance=1e-3,
@@ -68,16 +71,23 @@ class EmissionIntegrationPooled:
             chains.run()
         self.chains = chains  # fitted, frozen, never refit here
         rng = np.random.RandomState(seed)
+        rng_beta = np.random.RandomState(seed + 1)
         self.pin_beta = pin_beta
-        self.beta_mastered = (pin_beta if pin_beta is not None
-                              else 0.4 + 0.2 * rng.random_sample())
-        self.beta_unmastered = (pin_beta if pin_beta is not None
-                                else 0.4 + 0.2 * rng.random_sample())
+        n = self.CHANNELS
+        # betas draw from their own stream so every beta mode,
+        # pinned or free, gives identical per-KC initializations
+        self.beta_mastered = (np.full(n, float(pin_beta))
+                              if pin_beta is not None
+                              else 0.4 + 0.2 * rng_beta.random_sample(n))
+        self.beta_unmastered = (np.full(n, float(pin_beta))
+                                if pin_beta is not None
+                                else 0.4 + 0.2 * rng_beta.random_sample(n))
         self.train = self._sequences(train_data)
         self.test = self._sequences(test_data)
         kcs = sorted({k for seqs in self.train.values() for k in seqs})
-        # seeded random initialization per KC, the baseline's convention,
-        # so a beta-pinned-to-zero run is a like-for-like BKT refit
+        # seeded random initialization per KC, deterministic under the seed
+        # and identical across beta modes, a beta-pinned-to-zero run is the
+        # engine's own BKT refit, not a replication of pyBKT's initializer
         self.parameters = {k: {"prior": 0.2 + 0.4 * rng.random_sample(),
                                "learn": 0.1 + 0.3 * rng.random_sample(),
                                "guess": 0.1 + 0.3 * rng.random_sample(),
@@ -118,7 +128,7 @@ class EmissionIntegrationPooled:
                         f"dialogue {d}: retained turn at compact position "
                         f"{idx} beyond {len(m)} chain states, the BKT frame "
                         f"and the chain sequence disagree")
-                m_t = float(m[idx])  # state before this retained turn
+                m_t = np.atleast_1d(m[idx]).astype(float)  # state before
                 for kc in ast.literal_eval(row["kcs"]):
                     per_kc.setdefault(kc, []).append(
                         (int(row["_correct"]), m_t, int(row["_compact"])))
@@ -131,9 +141,9 @@ class EmissionIntegrationPooled:
         mastered = 1.0 - kc_params["slip"]
         unmastered = kc_params["guess"]
         if self.CONNECTION in ("mastered", "both"):
-            mastered = mastered - self.beta_mastered * m
+            mastered = mastered - float(np.dot(self.beta_mastered, m))
         if self.CONNECTION in ("unmastered", "both"):
-            unmastered = unmastered - self.beta_unmastered * m
+            unmastered = unmastered - float(np.dot(self.beta_unmastered, m))
         return max(mastered, CLIP), max(unmastered, CLIP)
 
     # ------------------------------------------------------------------- EM
@@ -171,7 +181,8 @@ class EmissionIntegrationPooled:
                         stats[kc][2] += xi[0, 1]
                         stats[kc][3] += gamma[t, 0]
                     for t, (c, m, _) in enumerate(seq):
-                        weighted[kc].append((gamma[t, 0], gamma[t, 1], c, m))
+                        weighted[kc].append(
+                            np.concatenate(([gamma[t, 0], gamma[t, 1], c], m)))
             if previous is not None and \
                     abs(log_likelihood - previous) <= self.tolerance:
                 break
@@ -189,7 +200,7 @@ class EmissionIntegrationPooled:
             rows_by_kc[kc] = rows
             p["prior"] = clip(s[0] / max(s[1], 1e-9))
             p["learn"] = clip(s[2] / max(s[3], 1e-9))
-            g0, _, c, _ = rows.T
+            g0, c = rows[:, 0], rows[:, 2]
             if self.CONNECTION == "mastered":
                 p["guess"] = clip((g0 * c).sum() / max(g0.sum(), 1e-9))
             else:
@@ -201,36 +212,43 @@ class EmissionIntegrationPooled:
                 lambda v: self._emission_ll(rows, guess=p["guess"], slip=v),
                 p["slip"]))
         if self.pin_beta is None:
-            if self.CONNECTION in ("mastered", "both"):
-                self.beta_mastered = clip(self._scalar_fit(
-                    lambda v: sum(self._emission_ll(
-                        rows_by_kc[k], beta_mastered=v,
-                        guess=self.parameters[k]["guess"],
-                        slip=self.parameters[k]["slip"])
-                        for k in rows_by_kc), self.beta_mastered))
-            if self.CONNECTION in ("unmastered", "both"):
-                self.beta_unmastered = clip(self._scalar_fit(
-                    lambda v: sum(self._emission_ll(
-                        rows_by_kc[k], beta_unmastered=v,
-                        guess=self.parameters[k]["guess"],
-                        slip=self.parameters[k]["slip"])
-                        for k in rows_by_kc), self.beta_unmastered))
+            for branch, betas in (("mastered", self.beta_mastered),
+                                  ("unmastered", self.beta_unmastered)):
+                if self.CONNECTION not in (branch, "both"):
+                    continue
+                for channel in range(self.CHANNELS):
+                    def objective(v, channel=channel, branch=branch):
+                        trial = betas.copy(); trial[channel] = v
+                        kwargs = {f"beta_{branch}": trial}
+                        return sum(self._emission_ll(
+                            rows_by_kc[k],
+                            guess=self.parameters[k]["guess"],
+                            slip=self.parameters[k]["slip"], **kwargs)
+                            for k in rows_by_kc)
+                    betas[channel] = clip(self._scalar_fit(
+                        objective, betas[channel]))
 
     def _emission_ll(self, rows, guess, slip, beta_mastered=None,
                      beta_unmastered=None):
         """Expected complete-data log-likelihood of the emission block."""
         bm = self.beta_mastered if beta_mastered is None else beta_mastered
         bu = self.beta_unmastered if beta_unmastered is None else beta_unmastered
-        g0, g1, c, m = rows.T
-        pm = 1.0 - slip - (bm * m if self.CONNECTION in ("mastered", "both")
-                           else 0.0)
-        pu = guess - (bu * m if self.CONNECTION in ("unmastered", "both")
-                      else 0.0)
+        g0, g1, c = rows[:, 0], rows[:, 1], rows[:, 2]
+        m = rows[:, 3:]
+        pm = 1.0 - slip - (m @ np.atleast_1d(bm)
+                           if self.CONNECTION in ("mastered", "both") else 0.0)
+        pu = guess - (m @ np.atleast_1d(bu)
+                      if self.CONNECTION in ("unmastered", "both") else 0.0)
         pm = np.clip(pm, CLIP, 1 - CLIP)
         pu = np.clip(pu, CLIP, 1 - CLIP)
         return float((g1 * (c * np.log(pm) + (1 - c) * np.log(1 - pm))
                       + g0 * (c * np.log(pu) + (1 - c) * np.log(1 - pu))
                       ).sum())
+
+    @staticmethod
+    def _report(betas):
+        values = [round(float(b), 4) for b in np.atleast_1d(betas)]
+        return values[0] if len(values) == 1 else values
 
     @staticmethod
     def _scalar_fit(objective, current):
@@ -292,9 +310,9 @@ class EmissionIntegrationPooled:
                 2 * tp + (predicted & (labels == 0)).sum()
                 + (~predicted & (labels == 1)).sum(), 1)), 4),
             "turns": int(len(labels)),
-            "beta_mastered": round(float(self.beta_mastered), 4)
+            "beta_mastered": self._report(self.beta_mastered)
                 if self.CONNECTION in ("mastered", "both") else None,
-            "beta_unmastered": round(float(self.beta_unmastered), 4)
+            "beta_unmastered": self._report(self.beta_unmastered)
                 if self.CONNECTION in ("unmastered", "both") else None,
             "pooling": self.pooling,
             "connection": self.CONNECTION,

@@ -9,8 +9,11 @@ slip, every capture rate a named scalar parameter:
     P(correct | unmastered) = g_k - beta_unmastered_conceptual * m_c
                                   - beta_unmastered_procedural * m_p
 
-on the wired branches, clipped at the floor. No pooling anywhere, the
-additive sum is the combination rule. The chains are GroupedChains under
+on the wired branches, clipped at the floor. Betas are absolute
+probability decrements per unit of chain state, descriptive, not causal
+capture rates. No post-chain scalar pooling, the five annotation
+families are pre-grouped into two chains by the P over A over N merge
+and the additive sum combines the two channels. The chains are GroupedChains under
 the chain of record, fitted first and frozen, their two filtered states
 before each turn are the channel inputs, solution row consumed by the
 chains, never by BKT. The three connection subclasses wire mastered,
@@ -54,9 +57,12 @@ class EmissionIntegrationGrouped:
             chains.run()
         self.chains = chains  # fitted, frozen, never refit here
         rng = np.random.RandomState(seed)
+        rng_beta = np.random.RandomState(seed + 1)
         self.pin_beta = pin_beta
+        # betas draw from their own stream so every beta mode,
+        # pinned or free, gives identical per-KC initializations
         draw = lambda: (float(pin_beta) if pin_beta is not None
-                        else 0.4 + 0.2 * rng.random_sample())
+                        else 0.4 + 0.2 * rng_beta.random_sample())
         self.beta_mastered_conceptual = draw()
         self.beta_mastered_procedural = draw()
         self.beta_unmastered_conceptual = draw()
